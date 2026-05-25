@@ -1,9 +1,6 @@
 const STORAGE_KEY = 'schedule-app-data-v1';
 
-const DEFAULT_STUDENTS = ['梦圆', '刘翰麟', '宾思程'];
-const DEFAULT_TEACHERS = ['Aaron', 'Oscar', '未指定'];
-
-export function loadPersistedData(fallbackSchedules) {
+export function loadPersistedData() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
@@ -11,12 +8,8 @@ export function loadPersistedData(fallbackSchedules) {
     if (!data || !Array.isArray(data.schedules)) return null;
     return {
       schedules: data.schedules,
-      students: Array.isArray(data.students) && data.students.length > 0
-        ? data.students
-        : DEFAULT_STUDENTS,
-      teachers: Array.isArray(data.teachers) && data.teachers.length > 0
-        ? data.teachers
-        : DEFAULT_TEACHERS,
+      students: Array.isArray(data.students) ? data.students : [],
+      teachers: Array.isArray(data.teachers) ? data.teachers : [],
       savedAt: data.savedAt || null,
     };
   } catch {
@@ -26,15 +19,13 @@ export function loadPersistedData(fallbackSchedules) {
 
 export function savePersistedData({ schedules, students, teachers }) {
   try {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        schedules,
-        students,
-        teachers,
-        savedAt: new Date().toISOString(),
-      })
-    );
+    const payload = {
+      schedules,
+      students,
+      teachers,
+      savedAt: new Date().toISOString(),
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     return true;
   } catch {
     return false;
@@ -42,9 +33,10 @@ export function savePersistedData({ schedules, students, teachers }) {
 }
 
 export function clearPersistedData() {
-  localStorage.removeItem(STORAGE_KEY);
-}
-
-export function exportDataAsJson({ schedules, students, teachers }) {
-  return JSON.stringify({ schedules, students, teachers, exportedAt: new Date().toISOString() }, null, 2);
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+    return true;
+  } catch {
+    return false;
+  }
 }

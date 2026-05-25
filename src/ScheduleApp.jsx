@@ -1,11 +1,15 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { 
-  Calendar, Clock, User, BookOpen, CheckCircle, Filter, X, 
+  Calendar, Clock, User, BookOpen, Filter, X, 
   Plus, Users, UserPlus, AlertTriangle, CalendarPlus, Check,
   List, Grid, ChevronLeft, ChevronRight, Edit, Trash2, FileSpreadsheet, Save, RotateCcw
 } from 'lucide-react';
 import { loadPersistedData, savePersistedData, clearPersistedData } from './utils/scheduleStorage';
 import { parseBatchImportText, IMPORT_FORMAT_HELP } from './utils/batchImport';
+import {
+  detectScheduleConflicts,
+  getConflictIdsFromSchedules,
+} from './utils/scheduleConflicts';
 
 const DEFAULT_STUDENTS = ['梦圆', '刘翰麟', '宾思程'];
 const DEFAULT_TEACHERS = ['Aaron', 'Oscar', '未指定'];
@@ -80,18 +84,14 @@ const getDayOfWeek = (dateStr) => {
   return isNaN(dateObj) ? '周日' : dayNames[dateObj.getDay()];
 };
 
-const hasOverlap = (start1, end1, start2, end2) => {
-  return start1 < end2 && start2 < end1;
-};
-
-// 列表精密对齐宽度定义
+// 列表精密对齐宽度定义（已移除状态/备注列）
 const COL_WIDTHS = {
-  date: 'w-[15%]',
-  time: 'w-[15%]',
+  date: 'w-[14%]',
+  time: 'w-[14%]',
   student: 'w-[12%]',
-  teacher: 'w-[15%]',
-  course: 'w-[23%]',
-  note: 'w-[20%]'
+  teacher: 'w-[14%]',
+  course: 'w-[32%]',
+  actions: 'w-[14%]',
 };
 
 export default function ScheduleApp() {
@@ -133,6 +133,13 @@ export default function ScheduleApp() {
   const [importPreview, setImportPreview] = useState(null);
   const [importMode, setImportMode] = useState('append');
 
+  // 编辑 / 删除单节课程
+  const [editCourseData, setEditCourseData] = useState(null);
+  const [deleteCourseTarget, setDeleteCourseTarget] = useState(null);
+
+  // 排课冲突确认（用户确认后才写入课表）
+  const [conflictDialog, setConflictDialog] = useState(null);
+
   // 新增排课弹窗
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalData, setModalData] = useState({
@@ -142,7 +149,6 @@ export default function ScheduleApp() {
     start: '13:50',
     end: '15:50',
     course: '新课程计划',
-    note: '正常',
     isRecurring: false,
     recurrenceType: 'weekly',
     recurrenceCount: 4
@@ -233,30 +239,21 @@ export default function ScheduleApp() {
     setEditTarget({ type: null, name: '', newName: '' });
   };
 
-  // 冲突排查 (Aaron & Oscar 绝对时间排他)
-  const conflictSet = useMemo(() => {
-    const conflicts = new Set();
-    const len = schedules.length;
-    for (let i = 0; i < len; i++) {
-      for (let j = i + 1; j < len; j++) {
-        const itemA = schedules[i];
-        const itemB = schedules[j];
+  // 冲突监测：教室有限（Aaron/Oscar 不能同时段）+ 同一教师重叠
+  const conflictSet = useMemo(
+    () => getConflictIdsFromSchedules(schedules),
+    [schedules]
+  );
 
-        if (itemA.date === itemB.date) {
-          const isStaffA = itemA.teacher === 'Aaron' || itemA.teacher === 'Oscar';
-          const isStaffB = itemB.teacher === 'Aaron' || itemB.teacher === 'Oscar';
-          
-          if (isStaffA && isStaffB) {
-            if (hasOverlap(itemA.start, itemA.end, itemB.start, itemB.end)) {
-              conflicts.add(itemA.id);
-              conflicts.add(itemB.id);
-            }
-          }
-        }
-      }
+  const runWithConflictCheck = (incoming, applyFn, options = {}) => {
+    const messages = detectScheduleConflicts(schedules, incoming, options);
+    if (messages.length > 0) {
+      setConflictDialog({ messages, onConfirm: () => { applyFn(); setConflictDialog(null); } });
+      return false;
     }
-    return conflicts;
-  }, [schedules]);
+    applyFn();
+    return true;
+  };
 
   // 视图级筛选过滤
   const filteredData = useMemo(() => {
@@ -285,11 +282,8 @@ export default function ScheduleApp() {
     return groups;
   }, [filteredData]);
 
-  // 规律自动排课导入
-  const handleCreateSchedules = (e) => {
-    e.preventDefault();
-    const { student, teacher, date, start, end, course, note, isRecurring, recurrenceType, recurrenceCount } = modalData;
-
+  const buildSessionsFromModal = () => {
+    const { student, teacher, date, start, end, course, isRecurring, recurrenceType, recurrenceCount } = modalData;
     const newSessions = [];
     const baseDate = new Date(date);
     const runs = isRecurring ? Math.max(1, parseInt(recurrenceCount, 10)) : 1;
@@ -317,18 +311,36 @@ export default function ScheduleApp() {
         student,
         teacher,
         course,
-        note: isRecurring ? `${note} (${i+1}/${runs}次)` : note
+        note: '',
       });
     }
+    return newSessions;
+  };
 
-    setSchedules(prev => [...prev, ...newSessions]);
-    setIsModalOpen(false);
-    triggerToast(`📅 已成功批量导入 ${runs} 节规律课程！`);
+  // 规律自动排课导入（冲突时需用户确认）
+  const handleCreateSchedules = (e) => {
+    e.preventDefault();
+    const { start, end } = modalData;
+    if (start >= end) {
+      triggerToast('⚠️ 结束时间须晚于开始时间');
+      return;
+    }
+
+    const newSessions = buildSessionsFromModal();
+    runWithConflictCheck(newSessions, () => {
+      setSchedules((prev) => [...prev, ...newSessions]);
+      setIsModalOpen(false);
+      triggerToast(`📅 已成功排入 ${newSessions.length} 节课程（已保存到本机）`);
+    });
   };
 
   const handleParseImportPreview = () => {
     const result = parseBatchImportText(importText);
-    setImportPreview(result);
+    const baseForCheck = importMode === 'replace' ? [] : schedules;
+    const conflictMessages = result.sessions.length
+      ? detectScheduleConflicts(baseForCheck, result.sessions)
+      : [];
+    setImportPreview({ ...result, conflictMessages });
     if (result.sessions.length === 0 && result.errors.length > 0) {
       triggerToast('⚠️ 未能解析有效课程，请检查格式');
     }
@@ -354,17 +366,28 @@ export default function ScheduleApp() {
       ...s,
       id: `import_${Date.now()}_${i}`,
     }));
-    mergePeopleFromSessions(withIds);
-    if (importMode === 'replace') {
-      setSchedules(withIds);
-      triggerToast(`📥 已替换为 ${withIds.length} 节课程（已保存到本机）`);
+
+    const applyImport = () => {
+      mergePeopleFromSessions(withIds);
+      if (importMode === 'replace') {
+        setSchedules(withIds);
+        triggerToast(`📥 已替换为 ${withIds.length} 节课程（已保存到本机）`);
+      } else {
+        setSchedules((prev) => [...prev, ...withIds]);
+        triggerToast(`📥 已追加导入 ${withIds.length} 节课程（已保存到本机）`);
+      }
+      setIsImportModalOpen(false);
+      setImportText('');
+      setImportPreview(null);
+    };
+
+    const baseForCheck = importMode === 'replace' ? [] : schedules;
+    const messages = detectScheduleConflicts(baseForCheck, withIds);
+    if (messages.length > 0) {
+      setConflictDialog({ messages, onConfirm: applyImport });
     } else {
-      setSchedules((prev) => [...prev, ...withIds]);
-      triggerToast(`📥 已追加导入 ${withIds.length} 节课程（已保存到本机）`);
+      applyImport();
     }
-    setIsImportModalOpen(false);
-    setImportText('');
-    setImportPreview(null);
   };
 
   const handleResetToDefault = () => {
@@ -375,6 +398,63 @@ export default function ScheduleApp() {
     setTeachers(DEFAULT_TEACHERS);
     setLastSavedAt(null);
     triggerToast('↩️ 已恢复默认课表');
+  };
+
+  const openEditCourse = (course) => {
+    setEditCourseData({
+      id: course.id,
+      student: course.student,
+      teacher: course.teacher,
+      date: course.date,
+      start: course.start,
+      end: course.end,
+      course: course.course,
+    });
+  };
+
+  const handleSaveEditCourse = (e) => {
+    e.preventDefault();
+    if (!editCourseData) return;
+    const { id, student, teacher, date, start, end, course } = editCourseData;
+    if (!date || !start || !end || !student || !course) {
+      triggerToast('⚠️ 请填写完整课程信息');
+      return;
+    }
+    if (start >= end) {
+      triggerToast('⚠️ 结束时间须晚于开始时间');
+      return;
+    }
+
+    const updated = {
+      id,
+      date,
+      day: getDayOfWeek(date),
+      start,
+      end,
+      student,
+      teacher: teacher || '未指定',
+      course,
+      note: '',
+    };
+
+    runWithConflictCheck([updated], () => {
+      setSchedules((prev) =>
+        prev.map((item) => (item.id === id ? { ...item, ...updated } : item))
+      );
+      if (!students.includes(student)) setStudents((prev) => [...prev, student]);
+      if (teacher && teacher !== '未指定' && !teachers.includes(teacher)) {
+        setTeachers((prev) => [...prev.filter((t) => t !== '未指定'), teacher, '未指定']);
+      }
+      setEditCourseData(null);
+      triggerToast('✏️ 课程信息已更新并保存');
+    }, { excludeIds: [id] });
+  };
+
+  const confirmDeleteCourse = () => {
+    if (!deleteCourseTarget) return;
+    setSchedules((prev) => prev.filter((item) => item.id !== deleteCourseTarget.id));
+    setDeleteCourseTarget(null);
+    triggerToast('🗑️ 已删除该节课程');
   };
 
   // 颜色样式映射
@@ -685,7 +765,7 @@ export default function ScheduleApp() {
 
                   {/* 自适应对齐表格 */}
                   <div className="overflow-x-auto">
-                    <div className="min-w-[850px] divide-y divide-slate-100">
+                    <div className="min-w-[800px] divide-y divide-slate-100">
                       
                       {/* 表头对齐 */}
                       <div className="flex items-center px-5 py-2.5 bg-slate-50/70 text-slate-400 font-extrabold text-[11px] uppercase tracking-wider text-left border-b border-slate-100">
@@ -694,7 +774,7 @@ export default function ScheduleApp() {
                         <div className={`${COL_WIDTHS.student} pr-2`}>上课学生</div>
                         <div className={`${COL_WIDTHS.teacher} pr-2`}>授课老师</div>
                         <div className={`${COL_WIDTHS.course} pr-2`}>课程项目/内容</div>
-                        <div className={`${COL_WIDTHS.note} pr-2`}>状态/备注</div>
+                        <div className={`${COL_WIDTHS.actions} pr-2 text-right`}>操作</div>
                       </div>
 
                       {/* 内容行 */}
@@ -734,24 +814,35 @@ export default function ScheduleApp() {
                             </div>
 
                             {/* 课程内容列 */}
-                            <div className={`${COL_WIDTHS.course} shrink-0 text-slate-700 font-bold flex items-center pr-3`}>
-                              <BookOpen className="w-3.5 h-3.5 mr-1.5 text-slate-400 shrink-0" />
+                            <div className={`${COL_WIDTHS.course} shrink-0 text-slate-700 font-bold flex items-center gap-2 pr-3 min-w-0`}>
+                              <BookOpen className="w-3.5 h-3.5 text-slate-400 shrink-0" />
                               <span className="truncate" title={course.course}>{course.course}</span>
-                            </div>
-
-                            {/* 备注备注列 */}
-                            <div className={`${COL_WIDTHS.note} shrink-0 flex items-center pr-2`}>
-                              {isConflict ? (
-                                <span className="inline-flex items-center gap-1 text-[11px] font-black text-red-600 bg-red-100 border border-red-200 px-2 py-0.5 rounded animate-pulse">
-                                  <AlertTriangle className="w-3 h-3 text-red-600 shrink-0" />
-                                  教师时间冲突
-                                </span>
-                              ) : (
-                                <span className="text-slate-500 text-[11px] flex items-center gap-1.5 truncate" title={course.note}>
-                                  <CheckCircle className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
-                                  <span className="truncate">{course.note}</span>
+                              {isConflict && (
+                                <span className="inline-flex items-center gap-0.5 text-[10px] font-black text-red-600 bg-red-100 border border-red-200 px-1.5 py-0.5 rounded shrink-0 animate-pulse">
+                                  <AlertTriangle className="w-3 h-3" />
+                                  冲突
                                 </span>
                               )}
+                            </div>
+
+                            {/* 操作列 */}
+                            <div className={`${COL_WIDTHS.actions} shrink-0 flex items-center justify-end gap-1 pr-1`}>
+                              <button
+                                type="button"
+                                onClick={() => openEditCourse(course)}
+                                className="p-1.5 hover:bg-indigo-100 text-slate-400 hover:text-indigo-600 rounded-md transition-colors cursor-pointer"
+                                title="修改课程"
+                              >
+                                <Edit className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setDeleteCourseTarget(course)}
+                                className="p-1.5 hover:bg-red-50 text-slate-400 hover:text-red-600 rounded-md transition-colors cursor-pointer"
+                                title="删除课程"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
                             </div>
 
                           </div>
@@ -883,7 +974,7 @@ export default function ScheduleApp() {
                 <span className="w-2.5 h-2.5 rounded bg-slate-400"></span> 待定老师
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded bg-rose-50 animate-pulse border border-rose-300"></span> ⚠️ 时间冲突
+                <span className="w-2.5 h-2.5 rounded bg-rose-50 animate-pulse border border-rose-300"></span> ⚠️ 教室/教师冲突
               </span>
             </div>
 
@@ -919,6 +1010,153 @@ export default function ScheduleApp() {
                 确认删除
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== 删除单节课程确认 ==================== */}
+      {deleteCourseTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-sm overflow-hidden">
+            <div className="p-5">
+              <div className="flex items-center gap-2.5 text-red-600 mb-3">
+                <AlertTriangle className="w-5 h-5" />
+                <h3 className="font-extrabold text-sm">确认删除此课程？</h3>
+              </div>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                将删除 <strong className="text-slate-900">{deleteCourseTarget.date}</strong> {' '}
+                <strong className="text-slate-900">{deleteCourseTarget.start}–{deleteCourseTarget.end}</strong> 的课节：
+                <br />
+                <span className="text-slate-800 font-bold">
+                  {deleteCourseTarget.student} · {deleteCourseTarget.course}
+                  {deleteCourseTarget.teacher !== '未指定' ? ` · ${deleteCourseTarget.teacher} 老师` : ''}
+                </span>
+                <br />
+                <span className="text-red-600 font-bold">删除后无法恢复。</span>
+              </p>
+            </div>
+            <div className="bg-slate-50 px-5 py-3 flex gap-2 justify-end border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setDeleteCourseTarget(null)}
+                className="px-3 py-1.5 text-xs font-bold text-slate-500 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={confirmDeleteCourse}
+                className="px-4 py-1.5 text-xs font-bold text-white bg-red-600 hover:bg-red-700 rounded-lg shadow transition-colors cursor-pointer"
+              >
+                确认删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== 编辑单节课程弹窗 ==================== */}
+      {editCourseData && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-lg overflow-hidden">
+            <div className="bg-slate-900 text-white px-5 py-3.5 flex items-center justify-between">
+              <h3 className="font-extrabold text-sm flex items-center gap-2">
+                <Edit className="w-5 h-5 text-indigo-400" />
+                修改课程信息
+              </h3>
+              <button
+                type="button"
+                onClick={() => setEditCourseData(null)}
+                className="text-slate-400 hover:text-white transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveEditCourse} className="p-5 space-y-4 max-h-[80vh] overflow-y-auto">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">上课学生</label>
+                  <select
+                    className="w-full bg-slate-50 border border-slate-200 rounded-lg text-xs p-2 focus:ring-1 focus:ring-indigo-500 font-bold cursor-pointer"
+                    value={editCourseData.student}
+                    onChange={(e) => setEditCourseData({ ...editCourseData, student: e.target.value })}
+                  >
+                    {students.map((s) => (
+                      <option key={s} value={s}>{s}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">授课教师</label>
+                  <select
+                    className="w-full bg-slate-50 border border-slate-200 rounded-lg text-xs p-2 focus:ring-1 focus:ring-indigo-500 font-bold cursor-pointer"
+                    value={editCourseData.teacher}
+                    onChange={(e) => setEditCourseData({ ...editCourseData, teacher: e.target.value })}
+                  >
+                    {teachers.map((t) => (
+                      <option key={t} value={t}>{t === '未指定' ? '暂不指派 (待定)' : `${t} 老师`}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">上课日期</label>
+                  <input
+                    type="date"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-lg text-xs p-2 focus:ring-1 focus:ring-indigo-500 font-medium"
+                    value={editCourseData.date}
+                    onChange={(e) => setEditCourseData({ ...editCourseData, date: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">开始时间</label>
+                  <input
+                    type="time"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-lg text-xs p-2 focus:ring-1 focus:ring-indigo-500 font-medium"
+                    value={editCourseData.start}
+                    onChange={(e) => setEditCourseData({ ...editCourseData, start: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">结束时间</label>
+                  <input
+                    type="time"
+                    className="w-full bg-slate-50 border border-slate-200 rounded-lg text-xs p-2 focus:ring-1 focus:ring-indigo-500 font-medium"
+                    value={editCourseData.end}
+                    onChange={(e) => setEditCourseData({ ...editCourseData, end: e.target.value })}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1">课程名称 / 级别</label>
+                <input
+                  type="text"
+                  className="w-full bg-slate-50 border border-slate-200 rounded-lg text-xs p-2 focus:ring-1 focus:ring-indigo-500"
+                  value={editCourseData.course}
+                  onChange={(e) => setEditCourseData({ ...editCourseData, course: e.target.value })}
+                />
+              </div>
+
+              <div className="flex gap-2.5 justify-end pt-3 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setEditCourseData(null)}
+                  className="px-4 py-2 text-xs font-bold text-slate-500 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+                >
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  className="px-5 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow transition-colors cursor-pointer"
+                >
+                  保存修改
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
@@ -1034,6 +1272,14 @@ export default function ScheduleApp() {
                       ))}
                     </ul>
                   )}
+                  {importPreview.conflictMessages?.length > 0 && (
+                    <ul className="px-3 py-2 text-[11px] text-red-700 bg-red-50 border-b border-red-100 max-h-28 overflow-y-auto">
+                      {importPreview.conflictMessages.map((msg, i) => (
+                        <li key={i}>⚠ {msg}</li>
+                      ))}
+                      <li className="mt-1 font-bold">导入时若仍有冲突，将弹出确认窗口。</li>
+                    </ul>
+                  )}
                   {importPreview.sessions.length > 0 && (
                     <div className="max-h-36 overflow-y-auto divide-y divide-slate-100 text-[11px]">
                       {importPreview.sessions.slice(0, 20).map((s, i) => (
@@ -1065,6 +1311,44 @@ export default function ScheduleApp() {
                 className="px-5 py-2 text-xs font-bold text-white bg-violet-600 hover:bg-violet-700 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg shadow cursor-pointer"
               >
                 确认导入并保存
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== 排课冲突确认弹窗 ==================== */}
+      {conflictDialog && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/70 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-xl shadow-2xl border border-red-200 w-full max-w-md overflow-hidden">
+            <div className="p-5">
+              <div className="flex items-center gap-2.5 text-red-600 mb-3">
+                <AlertTriangle className="w-5 h-5 shrink-0" />
+                <h3 className="font-extrabold text-sm">检测到排课冲突</h3>
+              </div>
+              <p className="text-xs text-slate-600 mb-3 leading-relaxed">
+                系统监测到教室或教师时间重叠（例如 Aaron 与 Oscar 不能同时段上课）。请确认是否仍要排入课表：
+              </p>
+              <ul className="text-[11px] text-red-800 bg-red-50 border border-red-100 rounded-lg p-3 max-h-40 overflow-y-auto space-y-1.5">
+                {conflictDialog.messages.map((msg, i) => (
+                  <li key={i}>• {msg}</li>
+                ))}
+              </ul>
+            </div>
+            <div className="bg-slate-50 px-5 py-3 flex gap-2 justify-end border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setConflictDialog(null)}
+                className="px-4 py-1.5 text-xs font-bold text-slate-600 hover:bg-slate-100 rounded-lg cursor-pointer"
+              >
+                取消，返回修改
+              </button>
+              <button
+                type="button"
+                onClick={conflictDialog.onConfirm}
+                className="px-4 py-1.5 text-xs font-bold text-white bg-red-600 hover:bg-red-700 rounded-lg shadow cursor-pointer"
+              >
+                我已知晓，确认排课
               </button>
             </div>
           </div>
@@ -1151,26 +1435,15 @@ export default function ScheduleApp() {
                 </div>
               </div>
 
-              {/* 4. 课程名称 & 备注 */}
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-slate-600 mb-1">课程名称 / 级别</label>
-                  <input
-                    type="text"
-                    className="w-full bg-slate-50 border border-slate-200 rounded-lg text-xs p-2 focus:ring-1 focus:ring-indigo-500"
-                    value={modalData.course}
-                    onChange={(e) => setModalData({ ...modalData, course: e.target.value })}
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-bold text-slate-600 mb-1">上课状态/备注</label>
-                  <input
-                    type="text"
-                    className="w-full bg-slate-50 border border-slate-200 rounded-lg text-xs p-2 focus:ring-1 focus:ring-indigo-500"
-                    value={modalData.note}
-                    onChange={(e) => setModalData({ ...modalData, note: e.target.value })}
-                  />
-                </div>
+              {/* 4. 课程名称 */}
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1">课程名称 / 级别</label>
+                <input
+                  type="text"
+                  className="w-full bg-slate-50 border border-slate-200 rounded-lg text-xs p-2 focus:ring-1 focus:ring-indigo-500"
+                  value={modalData.course}
+                  onChange={(e) => setModalData({ ...modalData, course: e.target.value })}
+                />
               </div>
 
               {/* 5. 规律排课逻辑 */}
