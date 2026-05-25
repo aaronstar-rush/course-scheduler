@@ -1,10 +1,11 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { 
   Calendar, Clock, User, BookOpen, Filter, X, 
   Plus, Users, UserPlus, AlertTriangle, CalendarPlus, Check,
   List, Grid, ChevronLeft, ChevronRight, Edit, Trash2, FileSpreadsheet, Save, RotateCcw
 } from 'lucide-react';
 import { loadPersistedData, savePersistedData, clearPersistedData } from './utils/scheduleStorage';
+import { fetchCloudSchedule, saveCloudSchedule } from './utils/cloudApi';
 import { parseBatchImportText, IMPORT_FORMAT_HELP } from './utils/batchImport';
 import {
   detectScheduleConflicts,
@@ -94,14 +95,27 @@ const COL_WIDTHS = {
   actions: 'w-[14%]',
 };
 
-export default function ScheduleApp() {
+export default function ScheduleApp({ cloudSyncEnabled = false }) {
   const initialState = useMemo(() => getInitialAppState(initialScheduleData), []);
 
-  // 数据源（从本机 localStorage 恢复，刷新不丢失）
-  const [schedules, setSchedules] = useState(initialState.schedules);
-  const [students, setStudents] = useState(initialState.students);
-  const [teachers, setTeachers] = useState(initialState.teachers);
-  const [lastSavedAt, setLastSavedAt] = useState(initialState.savedAt);
+  const [dataLoading, setDataLoading] = useState(cloudSyncEnabled);
+  const [syncStatus, setSyncStatus] = useState('idle');
+  const lastRemoteSavedAtRef = useRef(null);
+  const skipNextSaveRef = useRef(false);
+
+  // 数据源：云端模式登录后拉取；本地模式用 localStorage
+  const [schedules, setSchedules] = useState(
+    cloudSyncEnabled ? [] : initialState.schedules
+  );
+  const [students, setStudents] = useState(
+    cloudSyncEnabled ? [] : initialState.students
+  );
+  const [teachers, setTeachers] = useState(
+    cloudSyncEnabled ? [] : initialState.teachers
+  );
+  const [lastSavedAt, setLastSavedAt] = useState(
+    cloudSyncEnabled ? null : initialState.savedAt
+  );
 
   // 学生搜索和修改编辑状态
   const [searchStudentQuery, setSearchStudentQuery] = useState('');
@@ -154,11 +168,103 @@ export default function ScheduleApp() {
     recurrenceCount: 4
   });
 
-  // 自动保存到本机浏览器
+  // 从云端加载课表（登录后）
   useEffect(() => {
+    if (!cloudSyncEnabled) return undefined;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const data = await fetchCloudSchedule();
+        if (cancelled) return;
+        if (data) {
+          setSchedules(data.schedules);
+          setStudents(data.students);
+          setTeachers(data.teachers);
+          setLastSavedAt(data.savedAt);
+          lastRemoteSavedAtRef.current = data.savedAt;
+          savePersistedData(data);
+        } else {
+          setSchedules(initialScheduleData);
+          setStudents(DEFAULT_STUDENTS);
+          setTeachers(DEFAULT_TEACHERS);
+        }
+      } catch (err) {
+        if (!cancelled && err.message !== 'UNAUTHORIZED') {
+          triggerToast('⚠️ 云端加载失败，请刷新重试');
+        }
+      } finally {
+        if (!cancelled) setDataLoading(false);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [cloudSyncEnabled]);
+
+  // 本地模式：自动保存到浏览器
+  useEffect(() => {
+    if (cloudSyncEnabled || dataLoading) return;
     const ok = savePersistedData({ schedules, students, teachers });
     if (ok) setLastSavedAt(new Date().toISOString());
-  }, [schedules, students, teachers]);
+  }, [schedules, students, teachers, cloudSyncEnabled, dataLoading]);
+
+  // 云端模式：改完后防抖上传（约 1.5 秒）
+  useEffect(() => {
+    if (!cloudSyncEnabled || dataLoading) return undefined;
+    if (skipNextSaveRef.current) {
+      skipNextSaveRef.current = false;
+      return undefined;
+    }
+
+    setSyncStatus('pending');
+    const timer = setTimeout(async () => {
+      setSyncStatus('saving');
+      try {
+        const savedAt = await saveCloudSchedule({ schedules, students, teachers });
+        setLastSavedAt(savedAt);
+        lastRemoteSavedAtRef.current = savedAt;
+        setSyncStatus('synced');
+        savePersistedData({ schedules, students, teachers, savedAt });
+      } catch {
+        setSyncStatus('error');
+        triggerToast('⚠️ 云端保存失败');
+      }
+    }, 1500);
+
+    return () => clearTimeout(timer);
+  }, [schedules, students, teachers, cloudSyncEnabled, dataLoading]);
+
+  // 云端模式：每 60 秒拉取他人更新
+  useEffect(() => {
+    if (!cloudSyncEnabled || dataLoading) return undefined;
+
+    const poll = async () => {
+      if (syncStatus === 'saving') return;
+      try {
+        const data = await fetchCloudSchedule();
+        if (!data?.savedAt) return;
+        if (
+          lastRemoteSavedAtRef.current &&
+          data.savedAt <= lastRemoteSavedAtRef.current
+        ) {
+          return;
+        }
+        skipNextSaveRef.current = true;
+        setSchedules(data.schedules);
+        setStudents(data.students);
+        setTeachers(data.teachers);
+        setLastSavedAt(data.savedAt);
+        lastRemoteSavedAtRef.current = data.savedAt;
+        savePersistedData(data);
+        triggerToast('☁️ 已同步云端最新课表');
+      } catch {
+        /* 轮询失败静默 */
+      }
+    };
+
+    const interval = setInterval(poll, 60000);
+    return () => clearInterval(interval);
+  }, [cloudSyncEnabled, dataLoading, syncStatus]);
 
   const savedTimeLabel = useMemo(() => {
     if (!lastSavedAt) return null;
@@ -507,6 +613,14 @@ export default function ScheduleApp() {
     }
   };
 
+  if (dataLoading) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center text-slate-500 text-sm">
+        正在从云端加载课表…
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 font-sans pb-16 relative">
       
@@ -530,11 +644,26 @@ export default function ScheduleApp() {
                 排课管理系统
               </h1>
               <p className="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                <span>改完自动保存至本机浏览器</span>
+                {cloudSyncEnabled ? (
+                  <>
+                    <span>☁️ 云端共享课表 · Aaron / Oscar 同步</span>
+                    {syncStatus === 'saving' && (
+                      <span className="text-indigo-600 font-bold">保存中…</span>
+                    )}
+                    {syncStatus === 'pending' && (
+                      <span className="text-amber-600 font-bold">待保存</span>
+                    )}
+                    {syncStatus === 'error' && (
+                      <span className="text-red-600 font-bold">保存失败</span>
+                    )}
+                  </>
+                ) : (
+                  <span>改完自动保存至本机浏览器</span>
+                )}
                 {savedTimeLabel && (
                   <span className="inline-flex items-center gap-1 text-emerald-600 font-bold">
                     <Save className="w-3 h-3" />
-                    上次保存 {savedTimeLabel}
+                    {cloudSyncEnabled ? '云端更新' : '上次保存'} {savedTimeLabel}
                   </span>
                 )}
               </p>

@@ -1,5 +1,5 @@
-import ScheduleApp from './ScheduleApp'
+import LoginGate from './components/LoginGate'
 
 export default function App() {
-  return <ScheduleApp />
+  return <LoginGate />
 }
