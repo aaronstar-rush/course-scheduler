@@ -1,9 +1,25 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { 
   Calendar, Clock, User, BookOpen, CheckCircle, Filter, X, 
-  Plus, Users, UserPlus, Sliders, AlertTriangle, CalendarPlus, ChevronDown, Check,
-  List, Grid, ChevronLeft, ChevronRight, Edit, Trash2
+  Plus, Users, UserPlus, AlertTriangle, CalendarPlus, Check,
+  List, Grid, ChevronLeft, ChevronRight, Edit, Trash2, FileSpreadsheet, Save, RotateCcw
 } from 'lucide-react';
+import { loadPersistedData, savePersistedData, clearPersistedData } from './utils/scheduleStorage';
+import { parseBatchImportText, IMPORT_FORMAT_HELP } from './utils/batchImport';
+
+const DEFAULT_STUDENTS = ['梦圆', '刘翰麟', '宾思程'];
+const DEFAULT_TEACHERS = ['Aaron', 'Oscar', '未指定'];
+
+function getInitialAppState(defaultSchedules) {
+  const saved = loadPersistedData();
+  if (saved) return saved;
+  return {
+    schedules: defaultSchedules,
+    students: DEFAULT_STUDENTS,
+    teachers: DEFAULT_TEACHERS,
+    savedAt: null,
+  };
+}
 
 // 初始默认数据（已直接将 宾思程 绑定给 Aaron，刘翰麟 绑定给 Oscar，免除二次虚拟计算）
 const initialScheduleData = [
@@ -79,10 +95,13 @@ const COL_WIDTHS = {
 };
 
 export default function ScheduleApp() {
-  // 数据源
-  const [schedules, setSchedules] = useState(initialScheduleData);
-  const [students, setStudents] = useState(['梦圆', '刘翰麟', '宾思程']);
-  const [teachers, setTeachers] = useState(['Aaron', 'Oscar', '未指定']);
+  const initialState = useMemo(() => getInitialAppState(initialScheduleData), []);
+
+  // 数据源（从本机 localStorage 恢复，刷新不丢失）
+  const [schedules, setSchedules] = useState(initialState.schedules);
+  const [students, setStudents] = useState(initialState.students);
+  const [teachers, setTeachers] = useState(initialState.teachers);
+  const [lastSavedAt, setLastSavedAt] = useState(initialState.savedAt);
 
   // 学生搜索和修改编辑状态
   const [searchStudentQuery, setSearchStudentQuery] = useState('');
@@ -108,6 +127,12 @@ export default function ScheduleApp() {
   const [selectedStudent, setSelectedStudent] = useState('全部');
   const [selectedTeacher, setSelectedTeacher] = useState('全部');
 
+  // 智能批量导入
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [importText, setImportText] = useState('');
+  const [importPreview, setImportPreview] = useState(null);
+  const [importMode, setImportMode] = useState('append');
+
   // 新增排课弹窗
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalData, setModalData] = useState({
@@ -122,6 +147,23 @@ export default function ScheduleApp() {
     recurrenceType: 'weekly',
     recurrenceCount: 4
   });
+
+  // 自动保存到本机浏览器
+  useEffect(() => {
+    const ok = savePersistedData({ schedules, students, teachers });
+    if (ok) setLastSavedAt(new Date().toISOString());
+  }, [schedules, students, teachers]);
+
+  const savedTimeLabel = useMemo(() => {
+    if (!lastSavedAt) return null;
+    try {
+      return new Date(lastSavedAt).toLocaleString('zh-CN', {
+        month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      });
+    } catch {
+      return null;
+    }
+  }, [lastSavedAt]);
 
   // 过滤后的学生列表（用于搜索）
   const filteredStudents = useMemo(() => {
@@ -284,6 +326,57 @@ export default function ScheduleApp() {
     triggerToast(`📅 已成功批量导入 ${runs} 节规律课程！`);
   };
 
+  const handleParseImportPreview = () => {
+    const result = parseBatchImportText(importText);
+    setImportPreview(result);
+    if (result.sessions.length === 0 && result.errors.length > 0) {
+      triggerToast('⚠️ 未能解析有效课程，请检查格式');
+    }
+  };
+
+  const mergePeopleFromSessions = (sessions) => {
+    const newStudents = new Set(students);
+    const newTeachers = new Set(teachers.filter((t) => t !== '未指定'));
+    sessions.forEach((s) => {
+      if (s.student) newStudents.add(s.student);
+      if (s.teacher) newTeachers.add(s.teacher);
+    });
+    setStudents([...newStudents]);
+    setTeachers([...newTeachers, '未指定']);
+  };
+
+  const handleConfirmBatchImport = () => {
+    if (!importPreview?.sessions?.length) {
+      triggerToast('⚠️ 请先粘贴清单并点击「解析预览」');
+      return;
+    }
+    const withIds = importPreview.sessions.map((s, i) => ({
+      ...s,
+      id: `import_${Date.now()}_${i}`,
+    }));
+    mergePeopleFromSessions(withIds);
+    if (importMode === 'replace') {
+      setSchedules(withIds);
+      triggerToast(`📥 已替换为 ${withIds.length} 节课程（已保存到本机）`);
+    } else {
+      setSchedules((prev) => [...prev, ...withIds]);
+      triggerToast(`📥 已追加导入 ${withIds.length} 节课程（已保存到本机）`);
+    }
+    setIsImportModalOpen(false);
+    setImportText('');
+    setImportPreview(null);
+  };
+
+  const handleResetToDefault = () => {
+    if (!window.confirm('确定恢复为系统默认课表？当前本机保存的数据将被覆盖。')) return;
+    clearPersistedData();
+    setSchedules(initialScheduleData);
+    setStudents(DEFAULT_STUDENTS);
+    setTeachers(DEFAULT_TEACHERS);
+    setLastSavedAt(null);
+    triggerToast('↩️ 已恢复默认课表');
+  };
+
   // 颜色样式映射
   const getTeacherBgColor = (teacherName) => {
     if (teacherName === 'Aaron') return 'bg-blue-50 text-blue-700 border-blue-200';
@@ -356,7 +449,15 @@ export default function ScheduleApp() {
                 <Calendar className="w-6 h-6 text-indigo-600" />
                 排课管理系统
               </h1>
-              <p className="text-xs text-slate-500 mt-0.5">三栏对齐布局 · 学生与教师全周期自维护</p>
+              <p className="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                <span>改完自动保存至本机浏览器</span>
+                {savedTimeLabel && (
+                  <span className="inline-flex items-center gap-1 text-emerald-600 font-bold">
+                    <Save className="w-3 h-3" />
+                    上次保存 {savedTimeLabel}
+                  </span>
+                )}
+              </p>
             </div>
 
             {/* 控制器与工具区 */}
@@ -380,6 +481,14 @@ export default function ScheduleApp() {
                 </button>
               </div>
 
+              <button
+                onClick={() => { setImportPreview(null); setIsImportModalOpen(true); }}
+                className="bg-violet-600 hover:bg-violet-700 text-white px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors shadow-sm cursor-pointer"
+              >
+                <FileSpreadsheet className="w-4 h-4" />
+                智能批量导入
+              </button>
+
               {/* 启动规律排课 */}
               <button
                 onClick={() => setIsModalOpen(true)}
@@ -387,6 +496,14 @@ export default function ScheduleApp() {
               >
                 <CalendarPlus className="w-4 h-4" />
                 新增单次/规律排课
+              </button>
+
+              <button
+                onClick={handleResetToDefault}
+                className="bg-slate-200 hover:bg-slate-300 text-slate-700 px-2 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                title="恢复默认示例数据"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
               </button>
 
               {/* 快速添加学生 */}
@@ -841,6 +958,113 @@ export default function ScheduleApp() {
                 className="px-4 py-1.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow transition-colors cursor-pointer"
               >
                 保存修改
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== 智能批量导入弹窗 ==================== */}
+      {isImportModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4">
+          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-2xl overflow-hidden max-h-[90vh] flex flex-col">
+            <div className="bg-violet-900 text-white px-5 py-3.5 flex items-center justify-between shrink-0">
+              <h3 className="font-extrabold text-sm flex items-center gap-2">
+                <FileSpreadsheet className="w-5 h-5 text-violet-300" />
+                智能批量导入课程清单
+              </h3>
+              <button
+                onClick={() => { setIsImportModalOpen(false); setImportPreview(null); }}
+                className="text-slate-400 hover:text-white transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-3 overflow-y-auto flex-1">
+              <pre className="text-[10px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg p-3 whitespace-pre-wrap font-sans leading-relaxed">
+                {IMPORT_FORMAT_HELP}
+              </pre>
+
+              <textarea
+                className="w-full h-40 bg-slate-50 border border-slate-200 rounded-lg text-xs p-3 font-mono focus:ring-1 focus:ring-violet-500 focus:outline-none"
+                placeholder={'粘贴课程清单，例如：\n2026-06-03,13:50,15:50,宾思程,Aaron,SAT阅读语法,正常\n或：2026-06-03 13:50-15:50 宾思程 Aaron SAT阅读语法'}
+                value={importText}
+                onChange={(e) => { setImportText(e.target.value); setImportPreview(null); }}
+              />
+
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handleParseImportPreview}
+                  className="px-4 py-2 text-xs font-bold text-violet-700 bg-violet-100 hover:bg-violet-200 rounded-lg cursor-pointer"
+                >
+                  解析预览
+                </button>
+                <label className="flex items-center gap-2 text-xs font-bold text-slate-600 cursor-pointer">
+                  <input
+                    type="radio"
+                    checked={importMode === 'append'}
+                    onChange={() => setImportMode('append')}
+                  />
+                  追加到现有课表
+                </label>
+                <label className="flex items-center gap-2 text-xs font-bold text-slate-600 cursor-pointer">
+                  <input
+                    type="radio"
+                    checked={importMode === 'replace'}
+                    onChange={() => setImportMode('replace')}
+                  />
+                  替换全部课表
+                </label>
+              </div>
+
+              {importPreview && (
+                <div className="border border-slate-200 rounded-lg overflow-hidden">
+                  <div className="bg-slate-100 px-3 py-2 text-xs font-bold text-slate-700">
+                    解析结果：{importPreview.sessions.length} 节可导入
+                    {importPreview.errors.length > 0 && (
+                      <span className="text-amber-600 ml-2">· {importPreview.errors.length} 条警告</span>
+                    )}
+                  </div>
+                  {importPreview.errors.length > 0 && (
+                    <ul className="px-3 py-2 text-[11px] text-amber-700 bg-amber-50 border-b border-amber-100 max-h-24 overflow-y-auto">
+                      {importPreview.errors.map((err, i) => (
+                        <li key={i}>• {err}</li>
+                      ))}
+                    </ul>
+                  )}
+                  {importPreview.sessions.length > 0 && (
+                    <div className="max-h-36 overflow-y-auto divide-y divide-slate-100 text-[11px]">
+                      {importPreview.sessions.slice(0, 20).map((s, i) => (
+                        <div key={i} className="px-3 py-1.5 text-slate-600">
+                          {s.date} {s.start}-{s.end} · {s.student} · {s.teacher} · {s.course}
+                        </div>
+                      ))}
+                      {importPreview.sessions.length > 20 && (
+                        <div className="px-3 py-1.5 text-slate-400">… 另有 {importPreview.sessions.length - 20} 节</div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="bg-slate-50 px-5 py-3 flex gap-2 justify-end border-t border-slate-100 shrink-0">
+              <button
+                type="button"
+                onClick={() => { setIsImportModalOpen(false); setImportPreview(null); }}
+                className="px-4 py-2 text-xs font-bold text-slate-500 hover:bg-slate-100 rounded-lg cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmBatchImport}
+                disabled={!importPreview?.sessions?.length}
+                className="px-5 py-2 text-xs font-bold text-white bg-violet-600 hover:bg-violet-700 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg shadow cursor-pointer"
+              >
+                确认导入并保存
               </button>
             </div>
           </div>
