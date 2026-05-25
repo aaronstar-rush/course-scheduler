@@ -1,40 +1,26 @@
-# 云端登录与数据同步配置
+# 云端登录与数据同步（已自动配置）
 
-## 1. 创建 Supabase 项目
+本项目使用 **Vercel Blob** 存储共享课表，无需单独注册 Supabase。
 
-1. 打开 [https://supabase.com](https://supabase.com) 注册并新建项目  
-2. 进入 **SQL Editor**，粘贴并执行 `supabase/schema.sql`  
-3. 在 **Project Settings → API** 复制：
-   - **Project URL** → `SUPABASE_URL`
-   - **service_role** key（保密）→ `SUPABASE_SERVICE_ROLE_KEY`
+## 登录
 
-## 2. 配置 Vercel 环境变量
+- 地址：https://course-scheduler-kohl.vercel.app
+- 密码：`06251215`（Aaron / Oscar 共用）
+- 登录后课表自动云端保存，约 1.5 秒上传，每 60 秒同步他人修改
 
-在 Vercel 项目 **Settings → Environment Variables** 添加：
+## 环境变量（已在 Vercel 配置）
 
-| 变量名 | 值 |
-|--------|-----|
-| `ACCESS_PASSWORD` | `06251215`（或你自定义的密码） |
-| `AUTH_SECRET` | 任意 32 位以上随机字符串 |
-| `SUPABASE_URL` | Supabase 项目 URL |
-| `SUPABASE_SERVICE_ROLE_KEY` | Supabase service_role 密钥 |
+| 变量 | 说明 |
+|------|------|
+| `ACCESS_PASSWORD` | 登录密码 |
+| `AUTH_SECRET` | 登录会话签名 |
+| `BLOB_READ_WRITE_TOKEN` | Blob 存储（创建 Blob 时自动注入） |
 
-保存后 **重新部署** 一次。
-
-## 3. 使用说明
-
-- Aaron / Oscar 打开网站后输入密码登录  
-- 课表保存在 Supabase，两人看到同一份数据  
-- 修改后约 **1.5 秒** 自动上传云端  
-- 每 **60 秒** 自动拉取对方更新（最多约 1 分钟延迟）  
-- 右上角可 **退出登录**
-
-## 4. 本地调试（可选）
+## 本地调试
 
 ```bash
-cp .env.example .env.local
-# 编辑 .env.local 填入真实值
+npx vercel env pull
 npx vercel dev
 ```
 
-`npm run dev` 仅前端，无法调用 `/api`；完整功能请用 `vercel dev`。
+`npm run dev` 仅前端，无法使用登录 API。
